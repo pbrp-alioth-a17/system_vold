@@ -337,7 +337,7 @@ bool installKey(const std::string& mountpoint, const EncryptionOptions& options,
         policy->key_raw_ref =
                 std::string((char*)arg->key_spec.u.identifier, FSCRYPT_KEY_IDENTIFIER_SIZE);
     }
-    LOG(DEBUG) << "Installed fscrypt key with ref " << keyrefstring(policy->key_raw_ref) << " to "
+    LOG(INFO) << "Installed fscrypt key with ref " << keyrefstring(policy->key_raw_ref) << " to "
                << mountpoint;
     return true;
 }
@@ -423,7 +423,7 @@ bool evictKey(const std::string& mountpoint, const EncryptionPolicy& policy) {
         return false;
     }
 
-    LOG(DEBUG) << "Evicted fscrypt key with ref " << ref << " from " << mountpoint;
+    LOG(INFO) << "Evicted fscrypt key with ref " << ref << " from " << mountpoint;
     if (arg.removal_status_flags & FSCRYPT_KEY_REMOVAL_STATUS_FLAG_OTHER_USERS) {
         // Should never happen because keys are only added/removed as root.
         LOG(ERROR) << "Unexpected case: key with ref " << ref << " is still added by other users!";
@@ -444,7 +444,7 @@ bool retrieveOrGenerateKey(const std::string& key_path, const std::string& tmp_p
                            const KeyAuthentication& key_authentication, const KeyGeneration& gen,
                            KeyBuffer* key) {
     if (pathExists(key_path)) {
-        LOG(DEBUG) << "Key exists, using: " << key_path;
+        LOG(INFO) << "Key exists, using: " << key_path;
         if (!retrieveKey(key_path, key_authentication, key)) return false;
     } else {
         if (!gen.allow_gen) {
