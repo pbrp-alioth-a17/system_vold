@@ -131,6 +131,7 @@ std::map<userid_t, UserPolicies> s_ce_policies;
 std::map<userid_t, UserPolicies> s_de_policies;
 
 std::string de_key_raw_ref;
+bool retry = true;
 
 // Returns KeyGeneration suitable for key as described in EncryptionOptions
 static KeyGeneration makeGen(const EncryptionOptions& options) {

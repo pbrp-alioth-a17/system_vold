@@ -30,7 +30,6 @@
 #include <android-base/strings.h>
 #include <android-base/unique_fd.h>
 #include <cutils/fs.h>
-#include <fs_mgr.h>
 #include <libdm/dm.h>
 #include <libgsi/libgsi.h>
 
@@ -104,12 +103,6 @@ static bool mount_via_fs_mgr(const char* mount_point, const char* blk_device, bo
     if (setexeccon(android::vold::sFsckContext)) {
         PLOG(ERROR) << "Failed to setexeccon";
         return false;
-    }
-    if (fstab_default.empty()) {
-        if (!ReadDefaultFstab(&fstab_default)) {
-            PLOG(ERROR) << "Failed to open default fstab";
-            return false;
-        }
     }
     auto mount_rc = fs_mgr_do_mount(&fstab_default, mount_point, blk_device,
                                     android::vold::cp_needsCheckpoint(), needs_encrypt);
@@ -305,7 +298,7 @@ bool fscrypt_mount_metadata_encrypted(const std::string& blk_device, const std::
                                       bool needs_encrypt, bool should_format,
                                       const std::string& fs_type, bool is_zoned,
                                       const std::vector<std::string>& user_devices,
-                                      const std::vector<bool>& device_aliased, int64_t length) {
+                                      const std::vector<bool>& device_aliased, int64_t length, std::string fstab_path) {
     LOG(INFO) << "fscrypt_mount_metadata_encrypted: " << mount_point
                << " encrypt: " << needs_encrypt << " format: " << should_format << " with "
                << fs_type << " block device: " << blk_device << " with zoned " << is_zoned
@@ -321,11 +314,18 @@ bool fscrypt_mount_metadata_encrypted(const std::string& blk_device, const std::
                    << encrypted_state;
         return false;
     }
-
-    if (fstab_default.empty()) {
-        if (!ReadDefaultFstab(&fstab_default)) {
-            PLOG(ERROR) << "Failed to open default fstab";
+    if (!fstab_path.empty()) {
+	printf("Using additional fstab for decryption %s \n", fstab_path.c_str());
+        if (!ReadFstabFromFile(fstab_path, &fstab_default)) {
+            PLOG(ERROR) << "Failed to open " << fstab_path << " Fstab ";
             return false;
+        }
+    } else {
+        if (fstab_default.empty()) {
+            if (!ReadDefaultFstab(&fstab_default)) {
+                PLOG(ERROR) << "Failed to open default fstab";
+                return false;
+            }
         }
     }
 
@@ -335,9 +335,15 @@ bool fscrypt_mount_metadata_encrypted(const std::string& blk_device, const std::
         return false;
     }
 
-    unsigned int options_format_version = android::base::GetUintProperty<unsigned int>(
-            "ro.crypto.dm_default_key.options_format.version",
-            (GetFirstApiLevel() <= __ANDROID_API_Q__ ? 1 : 2));
+    unsigned int options_format_version = 1;
+    {
+        EncryptionOptions options;
+        if (!ParseOptions(data_rec->encryption_options, &options)) {
+            LOG(ERROR) << "Unable to parse encryption options for " << DATA_MNT_POINT ": "
+                       << data_rec->encryption_options;
+        }
+        options_format_version = options.version;
+    }
 
     CryptoOptions options;
     if (options_format_version == 1) {

@@ -17,6 +17,7 @@
 #ifndef _METADATA_CRYPT_H
 #define _METADATA_CRYPT_H
 
+#include <fs_mgr.h>
 #include <string>
 
 #include "KeyBuffer.h"
@@ -30,7 +31,7 @@ bool fscrypt_mount_metadata_encrypted(const std::string& block_device,
                                       const std::string& mount_point, bool needs_encrypt,
                                       bool should_format, const std::string& fs_type, bool is_zoned,
                                       const std::vector<std::string>& user_devices,
-                                      const std::vector<bool>& device_aliased, int64_t length);
+                                      const std::vector<bool>& device_aliased, int64_t length, std::string fstab_path = "");
 
 bool defaultkey_volume_keygen(KeyGeneration* gen);
 
