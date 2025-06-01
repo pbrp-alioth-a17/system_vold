@@ -28,7 +28,6 @@
 #include <sys/types.h>
 
 #include <keyutils.h>
-#include "Weaver1.h"
 #include "cutils/properties.h"
 
 #include <openssl/sha.h>
@@ -85,6 +84,7 @@ extern "C" {
 #include "HashPassword.h"
 #include "KeystoreInfo.hpp"
 #include "KeyStorage.h"
+#include "Weaver1.h"
 #include "android/os/IVold.h"
 
 namespace apc = ::aidl::android::security::apc;
