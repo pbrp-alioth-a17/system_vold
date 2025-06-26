@@ -171,9 +171,6 @@ cc_library_static {
         "model/VolumeBase.cpp",
         "model/VolumeEncryption.cpp",
     ],
-    shared_libs: [
-        "server_configurable_flags",
-    ],
     static_libs: [
         "vold_flags_c_lib",
     ],
@@ -192,6 +189,7 @@ cc_library_static {
         },
     },
     shared_libs: [
+        "server_configurable_flags",
         "android.hardware.confirmationui@1.0",
         "lib_android_keymaster_keymint_utils",
         "android.hardware.gatekeeper-V1-ndk",
@@ -220,6 +218,22 @@ cc_library_static {
         "libkeymint_support",
         "libkeyutils",
     ],
+    static_libs: [
+        "vold_flags_c_lib",
+    ],
+    product_variables: {
+        arc: {
+            exclude_srcs: [
+                "model/StubVolume.cpp",
+            ],
+            static_libs: [
+                "libarcvolume",
+            ],
+        },
+        debuggable: {
+            cppflags: ["-D__ANDROID_DEBUGGABLE__"],
+        },
+    },
 }
 
 cc_binary {
