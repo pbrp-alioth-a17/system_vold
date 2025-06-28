@@ -446,7 +446,7 @@ namespace android {
  * the keystore is not always ready when TWRP boots */
 android::sp<IBinder> getKeystoreBinder() {
 	android::sp<IServiceManager> sm = android::defaultServiceManager();
-    return sm->getService(String16("android.security.keystore"));
+    return sm->waitForService(String16("android.security.keystore"));
 }
 
 android::sp<IBinder> getKeystoreBinderRetry() {
@@ -931,7 +931,7 @@ bool Decrypt_User_Synth_Pass(const userid_t user_id, const std::string& Password
 					authToken.authenticatorType = static_cast<HardwareAuthenticatorType>(
 							betoh32(hwAuthToken->authenticator_type));
 					authToken.mac.assign(&hwAuthToken->hmac[0], &hwAuthToken->hmac[32]);
-					AIBinder* authzAIBinder = AServiceManager_getService("android.security.authorization");
+					AIBinder* authzAIBinder = AServiceManager_waitForService("android.security.authorization");
 					::ndk::SpAIBinder binder(authzAIBinder);
 					auto service = aidl::android::security::authorization::IKeystoreAuthorization::fromBinder(binder);
 					if (service == NULL) {
