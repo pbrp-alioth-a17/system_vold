@@ -1258,14 +1258,12 @@ bool IsSameFile(const std::string& path1, const std::string& path2) {
 status_t RestoreconRecursive(const std::string& path) {
     LOG(DEBUG) << "Starting restorecon of " << path;
 
-    static constexpr const char* kRestoreconString = "selinux.restorecon_recursive";
-
-    android::base::SetProperty(kRestoreconString, "");
-    if (!android::base::SetProperty(kRestoreconString, path)) {
-        return selinux_android_restorecon(path.c_str(), SELINUX_ANDROID_RESTORECON_RECURSE);
+    // AOSP hands this to init through selinux.restorecon_recursive. Recovery's
+    // init has no trigger for that property, so relabel here instead.
+    if (selinux_android_restorecon(path.c_str(), SELINUX_ANDROID_RESTORECON_RECURSE) != 0) {
+        PLOG(ERROR) << "Failed to restorecon " << path;
+        return -errno;
     }
-
-    android::base::WaitForProperty(kRestoreconString, path);
 
     LOG(DEBUG) << "Finished restorecon of " << path;
     return OK;
