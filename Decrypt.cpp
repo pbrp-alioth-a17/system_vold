@@ -28,7 +28,6 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-#include <keyutils.h>
 #include "cutils/properties.h"
 
 #include <openssl/sha.h>
@@ -65,14 +64,7 @@
 
 #include <gatekeeper/GateKeeperResponse.h>
 
-#include <keystore/keystore.h>
-#include <keystore/keystore_client.h>
-#include <keystore/KeystoreResponse.h>
-#include <keystore/keystore_hidl_support.h>
-#include <keystore/keystore_return_types.h>
-#include <keystore/keymaster_types.h>
 #include <keymasterV4_1/Keymaster.h>
-#include <keystore/OperationResult.h>
 #include <keymint_support/authorization_set.h>
 #include <keymasterV4_1/keymaster_utils.h>
 #include <KeyMintUtils.h>
@@ -96,17 +88,12 @@ using ::aidl::android::hardware::security::keymint::HardwareAuthenticatorType;
 using ::aidl::android::hardware::security::keymint::HardwareAuthToken;
 using ::aidl::android::hardware::security::keymint::km_utils::authToken2AidlVec;
 using aidl::android::system::keystore2::IKeystoreService;
-using android::security::keymaster::OperationResult;
-using android::hardware::keymaster::V4_1::support::blob2hidlVec;
 using AidlGatekeeperVerifyResp = aidl::android::hardware::gatekeeper::GatekeeperVerifyResponse;
 using AidlIGatekeeper = aidl::android::hardware::gatekeeper::IGatekeeper;
 using android::hardware::gatekeeper::V1_0::GatekeeperResponse;
 using GKResponse = ::android::service::gatekeeper::GateKeeperResponse;
 using GKResponseCode = ::android::service::gatekeeper::ResponseCode;
 
-inline std::string hidlVec2String(const ::keystore::hidl_vec<uint8_t>& value) {
-    return std::string(reinterpret_cast<const std::string::value_type*>(&value[0]), value.size());
-}
 
 static bool lookup_ref_key_internal(std::map<userid_t, UserPolicies> key_map, const uint8_t* policy, userid_t* user_id) {
 #ifdef USE_FSCRYPT_POLICY_V1
@@ -580,8 +567,7 @@ namespace keystore {
 			int32_t ret;
 			size_t maclen = 128;
 			unsigned char* iv = (unsigned char*)byteptr; // The IV is the first 12 bytes of the spblob
-			::keystore::hidl_vec<uint8_t> iv_hidlvec;
-			iv_hidlvec.setToExternal((unsigned char*)byteptr, 12);
+			std::vector<uint8_t> iv_hidlvec((unsigned char*)byteptr, (unsigned char*)byteptr + 12);
 			// printf("iv: "); output_hex((const unsigned char*)iv, 12); printf("\n");
 
 			KeystoreInfo keystore_info;
@@ -590,9 +576,7 @@ namespace keystore {
 			int32_t error_code;
 			unsigned char* cipher_text = (unsigned char*)byteptr + 12; // The cipher text comes immediately after the IV
 			std::string cipher_text_str(byteptr, byteptr + spblob_data.size() - 14);
-			::keystore::hidl_vec<uint8_t> cipher_text_hidlvec;
-
-			cipher_text_hidlvec.setToExternal(cipher_text, spblob_data.size() - 14 /* 1 each for version and SYNTHETIC_PASSWORD_PASSWORD_BASED and 12 for the iv */);
+			std::vector<uint8_t> cipher_text_hidlvec(cipher_text, cipher_text + spblob_data.size() - 14);
 			auto begin_params = keymint::AuthorizationSetBuilder()
 				.Authorization(keymint::TAG_ALGORITHM, ::keymint::Algorithm::AES)
 				.Authorization(::keymint::TAG_BLOCK_MODE, ::keymint::BlockMode::GCM)
@@ -751,7 +735,13 @@ bool Free_Return(bool retval, void* weaver_key, password_data_struct* pwd) {
 bool Decrypt_CE_storage(const userid_t user_id, const std::string& secret) {
 	printf("Attempting to unlock user storage\n");
 	int flags = android::os::IVold::STORAGE_FLAG_CE;
-	if (!fscrypt_unlock_ce_storage(user_id, secret)) {
+	std::string raw_secret;
+	if (secret != "!" && android::vold::HexToStr(secret, raw_secret) != 0) {
+		printf("Invalid CE secret encoding\n");
+		return false;
+	}
+	const std::vector<uint8_t> secret_bytes(raw_secret.begin(), raw_secret.end());
+	if (!fscrypt_unlock_ce_storage(user_id, secret_bytes)) {
 		printf("fscrypt_unlock_ce_storage returned fail\n");
 		return false;
 	}
@@ -888,7 +878,7 @@ bool Decrypt_User_Synth_Pass(const userid_t user_id, const std::string& Password
 			android::sp<android::hardware::gatekeeper::V1_0::IGatekeeper> gk_device;
 			constexpr const char gatekeeperServiceName[] = "android.hardware.gatekeeper.IGatekeeper/default";
 			if (AServiceManager_isDeclared(gatekeeperServiceName)) {
-				::ndk::SpAIBinder ks2Binder(AServiceManager_waitForService(gatekeeperServiceName));
+				::ndk::SpAIBinder ks2Binder(android::keystore::waitForService(gatekeeperServiceName));
 				aidl_gk_device = AidlIGatekeeper::fromBinder(ks2Binder);
 			}
 			if (!aidl_gk_device) {
@@ -988,7 +978,7 @@ bool Decrypt_User_Synth_Pass(const userid_t user_id, const std::string& Password
 					authToken.authenticatorType = static_cast<HardwareAuthenticatorType>(
 							betoh32(hwAuthToken->authenticator_type));
 					authToken.mac.assign(&hwAuthToken->hmac[0], &hwAuthToken->hmac[32]);
-					AIBinder* authzAIBinder = AServiceManager_waitForService("android.security.authorization");
+					AIBinder* authzAIBinder = android::keystore::waitForService("android.security.authorization");
 					::ndk::SpAIBinder binder(authzAIBinder);
 					auto service = aidl::android::security::authorization::IKeystoreAuthorization::fromBinder(binder);
 					if (service == NULL) {

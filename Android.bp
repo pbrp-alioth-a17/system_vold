@@ -57,6 +57,7 @@ cc_defaults {
         "libcrypto_utils",
         "libcutils",
         "libext4_utils",
+        "libfscrypt",
         "libf2fs_sparseblock",
         "libfec_rs",
         "libgsi",
@@ -216,24 +217,7 @@ cc_library_static {
         "libkeystoreinfo",
         "libkeystore-attestation-application-id",
         "libkeymint_support",
-        "libkeyutils",
     ],
-    static_libs: [
-        "vold_flags_c_lib",
-    ],
-    product_variables: {
-        arc: {
-            exclude_srcs: [
-                "model/StubVolume.cpp",
-            ],
-            static_libs: [
-                "libarcvolume",
-            ],
-        },
-        debuggable: {
-            cppflags: ["-D__ANDROID_DEBUGGABLE__"],
-        },
-    },
 }
 
 cc_binary {
@@ -361,6 +345,7 @@ cc_library {
 
 cc_binary {
     name: "fscryptpolicyget",
+    recovery_available: true,
     defaults: [
         "vold_default_flags",
         "vold_default_libs"
@@ -379,23 +364,12 @@ cc_binary {
     ]
 }
 
-bootstrap_go_package {
-    name: "soong-vold_defaults",
-    pkgPath: "system/vold",
-    deps: [
-        "soong",
-        "soong-android",
-        "soong-cc"
-    ],
-    srcs: [
-        "vold_defaults.go",
-        "soong/makevars.go"
-    ],
-    pluginFor: ["soong_build"]
-}
-
-vold_defaults {
-  name: "vold_defaults"
+cc_defaults {
+    name: "vold_defaults",
+    cflags: select(soong_config_variable("pbVarsPlugin", "TW_USE_FSCRYPT_POLICY"), {
+        "1": ["-DUSE_FSCRYPT_POLICY_V1"],
+        default: ["-DUSE_FSCRYPT_POLICY_V2"],
+    }),
 }
 
 aconfig_declarations {
