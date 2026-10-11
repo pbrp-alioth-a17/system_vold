@@ -192,17 +192,13 @@ cc_library_static {
     shared_libs: [
         "server_configurable_flags",
         "android.hardware.confirmationui@1.0",
-        "lib_android_keymaster_keymint_utils",
         "android.hardware.gatekeeper-V1-ndk",
         "android.hardware.gatekeeper@1.0",
-        "android.hardware.health.storage@1.0",
         "android.hardware.health.storage-V1-ndk",
         "android.hardware.keymaster@4.1",
-        "android.hardware.security.keymint-V4-ndk",
         "android.hardware.weaver@1.0",
         "android.hardware.weaver-V2-ndk",
         "android.security.apc-ndk",
-        "android.system.keystore2-V5-ndk",
         "android.security.authorization-ndk",
         "android.security.maintenance-ndk",
         "libbinder",
@@ -212,7 +208,6 @@ cc_library_static {
         "libhardware",
         "libhidlbase",
         "liblog",
-        "libchrome",
         "libkeymaster4_1support",
         "libkeystoreinfo",
         "libkeystore-attestation-application-id",
@@ -321,7 +316,6 @@ filegroup {
 
 cc_library {
     name: "libkeystoreinfo",
-    host_supported: true,
     cflags: [
         "-Wno-unused-parameter",
         "-Wno-unused-variable"
@@ -330,23 +324,18 @@ cc_library {
         "external/sqlite/dist/",
         "system/vold"
     ],
-    recovery_available: true,
     srcs: [
         "KeystoreInfo.cpp"
     ],
     shared_libs: [
         "libsqlite"
     ],
-    system_shared_libs: [
-        "libc", 
-        "libdl",
-        ],
 }
 
 cc_binary {
     name: "fscryptpolicyget",
-    recovery_available: true,
     defaults: [
+        "keystore2_use_latest_aidl_ndk_shared",
         "vold_default_flags",
         "vold_default_libs"
     ],
@@ -355,9 +344,8 @@ cc_binary {
     static_libs: ["libvold"],
 
     shared_libs: [
-        "android.hardware.health.storage@1.0",
+        "liblog",
         "android.hardware.health.storage-V1-ndk",
-        "android.system.keystore2-V5-ndk",
         "android.security.maintenance-ndk",
         "libbinder_ndk",
         "libkeymint_support",

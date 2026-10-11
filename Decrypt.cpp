@@ -44,11 +44,11 @@
 #include <future>
 #include <algorithm>
 #include <chrono>
+#include <thread>
 
 #include <android/binder_manager.h>
 #include <android-base/file.h>
 #include <android-base/logging.h>
-#include <base/threading/platform_thread.h>
 #include <android/hardware/confirmationui/1.0/types.h>
 #include <aidl/android/hardware/gatekeeper/IGatekeeper.h>
 #include <aidl/android/hardware/security/keymint/HardwareAuthToken.h>
@@ -64,10 +64,13 @@
 
 #include <gatekeeper/GateKeeperResponse.h>
 
-#include <keymasterV4_1/Keymaster.h>
 #include <keymint_support/authorization_set.h>
-#include <keymasterV4_1/keymaster_utils.h>
-#include <KeyMintUtils.h>
+#include <arpa/inet.h>
+#include <endian.h>
+#include <cstring>
+#include <charconv>
+#include <optional>
+#include <climits>
 
 extern "C" {
 #include "crypto_scrypt.h"
@@ -86,7 +89,21 @@ namespace ks2 = ::aidl::android::system::keystore2;
 
 using ::aidl::android::hardware::security::keymint::HardwareAuthenticatorType;
 using ::aidl::android::hardware::security::keymint::HardwareAuthToken;
-using ::aidl::android::hardware::security::keymint::km_utils::authToken2AidlVec;
+// Serialize the Gatekeeper token in the hw_auth_token_t wire format used by
+// Android KeyMintUtils, without linking a version-specific KeyMint HAL library.
+static std::vector<uint8_t> authToken2AidlVec(const std::optional<HardwareAuthToken>& token) {
+    if (!token || token->mac.size() != 32) return {};
+    hw_auth_token_t wire{};
+    wire.version = 0;
+    wire.challenge = token->challenge;
+    wire.user_id = token->userId;
+    wire.authenticator_id = token->authenticatorId;
+    wire.authenticator_type = htonl(static_cast<uint32_t>(token->authenticatorType));
+    wire.timestamp = htobe64(token->timestamp.milliSeconds);
+    std::memcpy(wire.hmac, token->mac.data(), sizeof(wire.hmac));
+    const auto* bytes = reinterpret_cast<const uint8_t*>(&wire);
+    return {bytes, bytes + sizeof(wire)};
+}
 using aidl::android::system::keystore2::IKeystoreService;
 using AidlGatekeeperVerifyResp = aidl::android::hardware::gatekeeper::GatekeeperVerifyResponse;
 using AidlIGatekeeper = aidl::android::hardware::gatekeeper::IGatekeeper;
@@ -95,124 +112,94 @@ using GKResponse = ::android::service::gatekeeper::GateKeeperResponse;
 using GKResponseCode = ::android::service::gatekeeper::ResponseCode;
 
 
-static bool lookup_ref_key_internal(std::map<userid_t, UserPolicies> key_map, const uint8_t* policy, userid_t* user_id) {
-#ifdef USE_FSCRYPT_POLICY_V1
-	char policy_string_hex[FS_KEY_DESCRIPTOR_SIZE_HEX];
-	char key_map_hex[FS_KEY_DESCRIPTOR_SIZE_HEX];
-	bytes_to_hex(policy, FS_KEY_DESCRIPTOR_SIZE, policy_string_hex);
-#else
-	char policy_string_hex[FSCRYPT_KEY_IDENTIFIER_HEX_SIZE];
-	char key_map_hex[FSCRYPT_KEY_IDENTIFIER_HEX_SIZE];
-	bytes_to_hex(policy, FSCRYPT_KEY_IDENTIFIER_SIZE, policy_string_hex);
-#endif
-
-    for (std::map<userid_t, UserPolicies>::iterator it=key_map.begin(); it!=key_map.end(); ++it) {
-#ifdef USE_FSCRYPT_POLICY_V1
-		bytes_to_hex(reinterpret_cast<const uint8_t*>(&it->second.internal.key_raw_ref[0]), FS_KEY_DESCRIPTOR_SIZE, key_map_hex);
-#else
-		bytes_to_hex(reinterpret_cast<const uint8_t*>(&it->second.internal.key_raw_ref[0]), FSCRYPT_KEY_IDENTIFIER_SIZE, key_map_hex);
-#endif
-		std::string key_map_hex_string = std::string(key_map_hex);
-		if (key_map_hex_string == policy_string_hex) {
-            *user_id = it->first;
+static bool lookup_ref_key_internal(const std::map<userid_t, UserPolicies>& key_map,
+        const uint8_t* policy, uint8_t size, uint8_t, userid_t* user_id) {
+    for (const auto& [id, policies] : key_map) {
+        const auto& raw = policies.internal.key_raw_ref;
+        if (raw.size() == size && std::memcmp(raw.data(), policy, size) == 0) {
+            *user_id = id;
             return true;
         }
     }
     return false;
 }
 
-#ifdef USE_FSCRYPT_POLICY_V1
-extern "C" bool lookup_ref_key(fscrypt_policy_v1* fep, uint8_t* policy_type) {
-#else
-extern "C" bool lookup_ref_key(fscrypt_policy_v2* fep, uint8_t* policy_type) {
-#endif
+extern "C" bool lookup_ref_key(fscrypt_policy* fep, uint8_t* policy_type) {
 	userid_t user_id = 0;
 	std::string policy_type_string;
 
-#ifdef USE_FSCRYPT_POLICY_V1
-	char policy_hex[FS_KEY_DESCRIPTOR_SIZE_HEX];
-	bytes_to_hex(fep->master_key_descriptor, FS_KEY_DESCRIPTOR_SIZE, policy_hex);
-	if (std::strncmp((const char*)fep->master_key_descriptor, de_key_raw_ref.c_str(), FS_KEY_DESCRIPTOR_SIZE) == 0) {
-		policy_type_string = SYSTEM_DE_FSCRYPT_POLICY;
+	uint8_t *descriptor = get_policy_descriptor(fep);
+	uint8_t hex_size = get_policy_size(fep, true);
+	uint8_t size = get_policy_size(fep, false);
+	char policy_hex[hex_size];
+	if (!descriptor || !size) return false;
+	bytes_to_hex(descriptor, size, policy_hex);
+	if (de_key_raw_ref.size() == size && std::memcmp(descriptor, de_key_raw_ref.data(), size) == 0) {
+		policy_type_string = std::to_string(fep->version) + SYSTEM_DE_FSCRYPT_POLICY;
 		memcpy(policy_type, policy_type_string.data(), policy_type_string.size());
 		return true;
 	}
-    if (!lookup_ref_key_internal(s_de_policies, fep->master_key_descriptor, &user_id)) {
-        if (!lookup_ref_key_internal(s_ce_policies, fep->master_key_descriptor, &user_id)) {
-            return false;
-		} else {
-			policy_type_string = USER_CE_FSCRYPT_POLICY + std::to_string(user_id);
-		}
-    } else {
-			policy_type_string = USER_DE_FSCRYPT_POLICY + std::to_string(user_id);
-	}
-#else
-	char policy_hex[FSCRYPT_KEY_IDENTIFIER_HEX_SIZE];
-	bytes_to_hex(fep->master_key_identifier, FSCRYPT_KEY_IDENTIFIER_SIZE, policy_hex);
-	if (std::strncmp((const char*)fep->master_key_identifier, de_key_raw_ref.c_str(), FSCRYPT_KEY_IDENTIFIER_SIZE) == 0) {
-		policy_type_string = SYSTEM_DE_FSCRYPT_POLICY;
-		memcpy(policy_type, policy_type_string.data(), policy_type_string.size());
-		return true;
-	}
-    if (!lookup_ref_key_internal(s_de_policies, fep->master_key_identifier, &user_id)) {
-        if (!lookup_ref_key_internal(s_ce_policies, fep->master_key_identifier, &user_id)) {
-            return false;
-		} else {
-			policy_type_string = USER_CE_FSCRYPT_POLICY + std::to_string(user_id);
-		}
-    } else {
-			policy_type_string = USER_DE_FSCRYPT_POLICY + std::to_string(user_id);
-	}
-#endif
+	if (!lookup_ref_key_internal(s_de_policies, descriptor, size, hex_size, &user_id)) {
+		if (!lookup_ref_key_internal(s_ce_policies, descriptor, size, hex_size, &user_id)) return false;
+		else policy_type_string = std::to_string(fep->version) + USER_CE_FSCRYPT_POLICY + std::to_string(user_id);
 
+	} else policy_type_string = std::to_string(fep->version) + USER_DE_FSCRYPT_POLICY + std::to_string(user_id);
+
+	if (policy_type_string.size() > size) return false;
 	memcpy(policy_type, policy_type_string.data(), policy_type_string.size());
-	printf("storing policy type: %s\n", policy_type);
-    return true;
+	printf("storing policy type: %.*s\n", size, policy_type);
+	return true;
 }
 
-extern "C" bool lookup_ref_tar(const uint8_t* policy_type, uint8_t* policy) {
-	std::string policy_type_string = std::string((char *) policy_type);
-#ifdef USE_FSCRYPT_POLICY_V1
-	char policy_hex[FS_KEY_DESCRIPTOR_SIZE_HEX];
-	bytes_to_hex(policy_type, FS_KEY_DESCRIPTOR_SIZE, policy_hex);
-#else
-	char policy_hex[FSCRYPT_KEY_IDENTIFIER_HEX_SIZE];
-	bytes_to_hex(policy_type, FSCRYPT_KEY_IDENTIFIER_SIZE, policy_hex);
-#endif
-
-#ifdef USE_FSCRYPT_POLICY_V1
-	if (policy_type_string.substr(0,1) != FSCRYPT_V1) {
-#else
-	if (policy_type_string.substr(0,1) != FSCRYPT_V2) {
-#endif
-        printf("Unexpected version: %d\n", policy_type[0]);
-        return false;
-    }
-
+extern "C" bool lookup_ref_tar(fscrypt_policy *fep, uint8_t* policy) {
+	if (fep->version < FSCRYPT_POLICY_V1 || fep->version > FSCRYPT_POLICY_V2) {
+		printf("Unexpected version: %d\n", (int)fep->version);
+		return false;
+	}
+	uint8_t hex_size, size, *descriptor;
+	hex_size = get_policy_size(fep, true);
+	size = get_policy_size(fep, false);
+	descriptor = get_policy_descriptor(fep);
+	std::string policy_type_string = std::string((char *) descriptor, strnlen((char *) descriptor, size));
+	char policy_hex[hex_size];
+	bytes_to_hex(descriptor, size, policy_hex);
 	if (policy_type_string.substr(1, 2) == SYSTEM_DE_KEY) {
-        memcpy(policy, de_key_raw_ref.data(), de_key_raw_ref.size());
-        return true;
-    }
+		if (de_key_raw_ref.size() != size) return false;
+		memcpy(policy, de_key_raw_ref.data(), de_key_raw_ref.size());
+		return true;
+	}
 
-    std::string raw_ref;
+	std::string raw_ref;
 
 	if (policy_type_string.substr(1, 1) == USER_DE_KEY) {
-		userid_t user_id = std::stoi(policy_type_string.substr(3, 4).c_str());
-        if (lookup_key_ref(s_de_policies, user_id, &raw_ref)) {
-            memcpy(policy, raw_ref.data(), raw_ref.size());
-        } else
-            return false;
-    } else if (policy_type_string.substr(1, 1) == USER_CE_KEY) {
-		userid_t user_id = std::stoi(policy_type_string.substr(3, 4).c_str());
-        if (lookup_key_ref(s_ce_policies, user_id, &raw_ref)) {
-            memcpy(policy, raw_ref.data(), raw_ref.size());
-        } else
-            return false;
-    } else {
-        printf("unknown policy type: %s\n", policy_type);
-        return false;
-    }
-    return true;
+		if (policy_type_string.size() <= 3) return false;
+		userid_t user_id;
+		const char* end = policy_type_string.data() + policy_type_string.size();
+		auto parsed = std::from_chars(policy_type_string.data() + 3, end, user_id);
+		if (parsed.ec != std::errc{} || parsed.ptr != end) return false;
+		if (lookup_key_ref(s_de_policies, user_id, &raw_ref)) {
+			if (raw_ref.size() != size) return false;
+			memcpy(policy, raw_ref.data(), raw_ref.size());
+		} else {
+			return false;
+		}
+	} else if (policy_type_string.substr(1, 1) == USER_CE_KEY) {
+		if (policy_type_string.size() <= 3) return false;
+		userid_t user_id;
+		const char* end = policy_type_string.data() + policy_type_string.size();
+		auto parsed = std::from_chars(policy_type_string.data() + 3, end, user_id);
+		if (parsed.ec != std::errc{} || parsed.ptr != end) return false;
+		if (lookup_key_ref(s_ce_policies, user_id, &raw_ref)) {
+			if (raw_ref.size() != size) return false;
+			memcpy(policy, raw_ref.data(), raw_ref.size());
+		} else {
+			return false;
+		}
+	} else {
+		printf("unknown policy type: %s\n", descriptor);
+		return false;
+	}
+	return true;
 }
 
 extern "C" bool Decrypt_DE() {
@@ -227,40 +214,6 @@ extern "C" bool Decrypt_DE() {
 	}
 	return true;
 }
-
-// Crappy functions for debugging, please ignore unless you need to debug
-// void output_hex(const std::string& in) {
-// 	const char *buf = in.data();
-// 	char hex[in.size() * 2 + 1];
-// 	unsigned int index;
-// 	for (index = 0; index < in.size(); index++)
-// 		sprintf(&hex[2 * index], "%02X", buf[index]);
-// }
-
-// void output_hex(const char* buf, const int size) {
-// 	char hex[size * 2 + 1];
-// 	int index;
-// 	for (index = 0; index < size; index++)
-// 		sprintf(&hex[2 * index], "%02X", buf[index]);
-// 	printf("%s", hex);
-// }
-
-// void output_hex(const unsigned char* buf, const int size) {
-// 	char hex[size * 2 + 1];
-// 	int index;
-// 	for (index = 0; index < size; index++)
-// 		sprintf(&hex[2 * index], "%02X", buf[index]);
-// 	printf("%s", hex);
-// }
-
-// void output_hex(std::vector<uint8_t>* vec) {
-// 	char hex[3];
-// 	unsigned int index;
-// 	for (index = 0; index < vec->size(); index++) {
-// 		sprintf(&hex[0], "%02X", vec->at(index));
-// 		printf("%s", hex);
-// 	}
-// }
 
 /* This is the structure of the data in the password data (*.pwd) file which the structure can be found
  * https://android.googlesource.com/platform/frameworks/base/+/android-8.0.0_r23/services/core/java/com/android/server/locksettings/SyntheticPasswordManager.java#187 */
@@ -306,7 +259,6 @@ bool Get_Password_Data(const std::string& spblob_path, const std::string& handle
 	std::string pwd_data;
 	if (!Get_Spblob_Data(spblob_path, handle_str, ".pwd", "password", &pwd_data))
 		return false;
-	// output_hex(pwd_data.data(), pwd_data.size());printf("\n");
 	const int* intptr = (const int*)pwd_data.data();
 	pwd->password_type = *intptr;
 	endianswap(&pwd->password_type);
@@ -415,7 +367,6 @@ bool Get_Weaver_Data(const std::string& spblob_path, const std::string& handle_s
 		printf("Get_Weaver_Data: No weaver file found for %s\n", handle_str.c_str());
 		return found_file;
 	} else {
-		// output_hex(weaver_data.data(), weaver_data.size());printf("\n");
 		const unsigned char* byteptr = (const unsigned char*)weaver_data.data();
 		wd->version = *byteptr;
 		// printf("weaver version %i\n", wd->version);
@@ -537,6 +488,11 @@ namespace keystore {
 		std::string spblob_data;
 		if (!Get_Spblob_Data(spblob_path, handle_str, ".spblob", "spblob", &spblob_data))
 			return disk_decryption_secret_key;
+		// Version/type, 12-byte GCM nonce and 16-byte authentication tag.
+		if (spblob_data.size() < 30) {
+			printf("Synthetic password blob is truncated\n");
+			return disk_decryption_secret_key;
+		}
 		unsigned char* byteptr = (unsigned char*)spblob_data.data();
 		if (*byteptr != SYNTHETIC_PASSWORD_VERSION_V2 && *byteptr != SYNTHETIC_PASSWORD_VERSION_V1
 				&& *byteptr != SYNTHETIC_PASSWORD_VERSION_V3) {
@@ -568,7 +524,6 @@ namespace keystore {
 			size_t maclen = 128;
 			unsigned char* iv = (unsigned char*)byteptr; // The IV is the first 12 bytes of the spblob
 			std::vector<uint8_t> iv_hidlvec((unsigned char*)byteptr, (unsigned char*)byteptr + 12);
-			// printf("iv: "); output_hex((const unsigned char*)iv, 12); printf("\n");
 
 			KeystoreInfo keystore_info;
 			std::string handle = keystore_info.getHandle(user_id);
@@ -586,8 +541,9 @@ namespace keystore {
 				.Authorization(::keymint::TAG_MAC_LENGTH, maclen);
 
 			ks2::KeyEntryResponse keyEntryResponse;
-			::ndk::SpAIBinder keystoreBinder(AServiceManager_checkService("android.system.keystore2.IKeystoreService/default"));
+			::ndk::SpAIBinder keystoreBinder(waitForService("android.system.keystore2.IKeystoreService/default"));
 			auto keystore = ks2::IKeystoreService::fromBinder(keystoreBinder);
+			if (!keystore) return disk_decryption_secret_key;
 			auto rc = keystore->getKeyEntry(keyDescriptor(keystore_alias), &keyEntryResponse);
 			if (!rc.isOk()) {
 				auto error = unwrapError(rc);
@@ -601,6 +557,7 @@ namespace keystore {
 			std::variant<int, ks2::KeyEntryResponse> response = keyEntryResponse;
 			auto keyResponse = std::get<ks2::KeyEntryResponse>(response);
 			ks2::CreateOperationResponse encOperationResponse;
+			if (!keyResponse.iSecurityLevel) return disk_decryption_secret_key;
 			auto begin_rc = keyResponse.iSecurityLevel->createOperation(
 				keyResponse.metadata.key, begin_params.vector_data(), true,
 				&encOperationResponse);
@@ -629,52 +586,55 @@ namespace keystore {
 			}
 			std::optional<std::vector<uint8_t>> optPlaintext;
 
+			if (!encOperationResponse.iOperation) return disk_decryption_secret_key;
 			begin_rc = encOperationResponse.iOperation->finish(cipher_text_hidlvec, {}, &optPlaintext);
 			if (!begin_rc.isOk()) {
 				printf("finish reponse failed");
 				return disk_decryption_secret_key;
 			}
 
+			if (!optPlaintext || optPlaintext->size() <= 12 + 16 || optPlaintext->size() > INT_MAX) {
+				return disk_decryption_secret_key;
+			}
 			size_t keystore_result_size = optPlaintext->size();
 			unsigned char* keystore_result = (unsigned char*)malloc(keystore_result_size);
 			if (!keystore_result) {
 				printf("malloc on keystore_result\n");
 				return disk_decryption_secret_key;
 			}
-			memcpy(keystore_result, &optPlaintext->front(), keystore_result_size);
+			memcpy(keystore_result, optPlaintext->data(), keystore_result_size);
 
 			const unsigned char* intermediate_iv = keystore_result;
-			// printf("intermediate_iv: "); output_hex((const unsigned char*)intermediate_iv, 12); printf("\n");
 			const unsigned char* intermediate_cipher_text = (const unsigned char*)keystore_result + 12; // The cipher text comes immediately after the IV
 			int cipher_size = keystore_result_size - 12;
 			// First we personalize as seen https://android.googlesource.com/platform/frameworks/base/+/android-8.0.0_r23/services/core/java/com/android/server/locksettings/SyntheticPasswordCrypto.java#102
 			void* personalized_application_id = PersonalizedHashBinary(PERSONALISATION_APPLICATION_ID, (const char*)application_id, application_id_size);
 			if (!personalized_application_id) {
 				printf("Unable to obtain personalized_application_id\n");
+				free(keystore_result);
 				return disk_decryption_secret_key;
 			}
-			// printf("personalized application id: "); output_hex((unsigned char*)personalized_application_id, SHA512_DIGEST_LENGTH); printf("\n");
 			// Now we'll decrypt using openssl AES/GCM/NoPadding
-			OpenSSL_add_all_ciphers();
-			int actual_size=0, final_size=0;
-			EVP_CIPHER_CTX *d_ctx = EVP_CIPHER_CTX_new();
-			const unsigned char* key = (const unsigned char*)personalized_application_id; // The key is the now personalized copy of the application ID
-			// printf("key: "); output_hex((const unsigned char*)key, 32); printf("\n");
-			EVP_DecryptInit(d_ctx, EVP_aes_256_gcm(), key, intermediate_iv);
-			unsigned char* secret_key = (unsigned char*)malloc(cipher_size);
-			if (!secret_key) {
-				printf("malloc failure on secret key\n");
-				return disk_decryption_secret_key;
-			}
-			EVP_DecryptUpdate(d_ctx, secret_key, &actual_size, intermediate_cipher_text, cipher_size);
-			unsigned char tag[AES_BLOCK_SIZE];
-			EVP_CIPHER_CTX_ctrl(d_ctx, EVP_CTRL_GCM_SET_TAG, 16, tag);
-			EVP_DecryptFinal_ex(d_ctx, secret_key + actual_size, &final_size);
+			int actual_size = 0, final_size = 0;
+			EVP_CIPHER_CTX* d_ctx = EVP_CIPHER_CTX_new();
+			const unsigned char* key = static_cast<const unsigned char*>(personalized_application_id);
+			const int encrypted_size = cipher_size - 16;
+			unsigned char* secret_key = static_cast<unsigned char*>(malloc(encrypted_size + AES_BLOCK_SIZE));
+			const bool decrypted = d_ctx && secret_key &&
+				EVP_DecryptInit_ex(d_ctx, EVP_aes_256_gcm(), nullptr, key, intermediate_iv) == 1 &&
+				EVP_DecryptUpdate(d_ctx, secret_key, &actual_size, intermediate_cipher_text, encrypted_size) == 1 &&
+				EVP_CIPHER_CTX_ctrl(d_ctx, EVP_CTRL_GCM_SET_TAG, 16,
+					const_cast<unsigned char*>(intermediate_cipher_text + encrypted_size)) == 1 &&
+				EVP_DecryptFinal_ex(d_ctx, secret_key + actual_size, &final_size) == 1;
 			EVP_CIPHER_CTX_free(d_ctx);
 			free(personalized_application_id);
 			free(keystore_result);
-			int secret_key_real_size = actual_size - 16;
-			// printf("secret key:  "); output_hex((const unsigned char*)secret_key, secret_key_real_size); printf("\n");
+			if (!decrypted) {
+				free(secret_key);
+				printf("Synthetic password authentication failed\n");
+				return disk_decryption_secret_key;
+			}
+			const int secret_key_real_size = actual_size + final_size;
 			// The payload data from the keystore update is further personalized at https://android.googlesource.com/platform/frameworks/base/+/android-8.0.0_r23/services/core/java/com/android/server/locksettings/SyntheticPasswordManager.java#153
 			// We now have the disk decryption key!
 			if (*synthetic_password_version == SYNTHETIC_PASSWORD_VERSION_V3) {
@@ -696,7 +656,6 @@ namespace keystore {
 //  * https://android.googlesource.com/platform/frameworks/base/+/android-8.0.0_r23/services/core/java/com/android/server/locksettings/SyntheticPasswordManager.java#813 */
 bool Get_Secdis(const std::string& spblob_path, const std::string& handle_str, std::string& secdis_data) {
 	return Get_Spblob_Data(spblob_path, handle_str, ".secdis", "secdis", &secdis_data);
-	// output_hex(secdis_data.data(), secdis_data.size());printf("\n");
 }
 
 // // C++ replacement for https://android.googlesource.com/platform/frameworks/base/+/android-8.0.0_r23/services/core/java/com/android/server/locksettings/SyntheticPasswordManager.java#1033
@@ -784,7 +743,6 @@ bool Decrypt_User_Synth_Pass(const userid_t user_id, const std::string& Password
 	}
 	// Now we begin driving unwrapPasswordBasedSyntheticPassword from: https://android.googlesource.com/platform/frameworks/base/+/android-8.0.0_r23/services/core/java/com/android/server/locksettings/SyntheticPasswordManager.java#758
 	// First we read the password data which contains scrypt parameters
-	// printf("pwd N %i R %i P %i salt ", pwd.scryptN, pwd.scryptR, pwd.scryptP); output_hex((char*)pwd.salt, pwd.salt_len); printf("\n");
 	// printf("Password: '%s'\n", Password.c_str());
 	// The password token is the password scrypted with the parameters from the password data file
 	unsigned char password_token[PASSWORD_TOKEN_SIZE];
@@ -802,7 +760,6 @@ bool Decrypt_User_Synth_Pass(const userid_t user_id, const std::string& Password
 		std::string defpassword = "default-password";
 		memcpy(password_token, defpassword.data(), defpassword.length());
 	}
-	// output_hex(&password_token[0], PASSWORD_TOKEN_SIZE);printf("\n");
 	if (Is_Weaver(spblob_path, handle_str)) {
 		printf("using weaver\n");
 		// BEGIN PIXEL 2 WEAVER
@@ -835,7 +792,6 @@ bool Decrypt_User_Synth_Pass(const userid_t user_id, const std::string& Password
 		} else {
 			printf("weaver key size is %u\n", weaver_key_size);
 		}
-		// printf("weaver key: "); output_hex((unsigned char*)weaver_key, weaver_key_size); printf("\n");
 		// Send the slot from the .weaver file, the computed weaver key, and get the escrowed key data
 		std::vector<uint8_t> weaver_payload;
 		// TODO: we should return more information about the status including time delays before the next retry
@@ -843,18 +799,15 @@ bool Decrypt_User_Synth_Pass(const userid_t user_id, const std::string& Password
 			printf("failed to weaver verify\n");
 			return Free_Return(retval, weaver_key, &pwd);
 		}
-		// printf("weaver payload: "); output_hex(&weaver_payload); printf("\n");
 		// Done with weaverVerify
 		// Now we will compute the application ID
 		// https://android.googlesource.com/platform/frameworks/base/+/android-8.0.0_r23/services/core/java/com/android/server/locksettings/SyntheticPasswordManager.java#964
 		// Called from https://android.googlesource.com/platform/frameworks/base/+/android-8.0.0_r23/services/core/java/com/android/server/locksettings/SyntheticPasswordManager.java#780
 		// The escrowed weaver key data is prefixed with "weaver-pwd" padded to 128 with nulls with the weaver payload appended then SHA512
 		void* weaver_secret = PersonalizedHashBinary(PERSONALISATION_WEAVER_PASSWORD, (const char*)weaver_payload.data(), weaver_payload.size());
-		// printf("weaver secret: "); output_hex((unsigned char*)weaver_secret, SHA512_DIGEST_LENGTH); printf("\n");
 		// The application ID is the password token and weaver secret appended to each other
 		memcpy((void*)&application_id[0], (void*)&password_token[0], PASSWORD_TOKEN_SIZE);
 		memcpy((void*)&application_id[PASSWORD_TOKEN_SIZE], weaver_secret, SHA512_DIGEST_LENGTH);
-		// printf("application ID: "); output_hex((unsigned char*)application_id, PASSWORD_TOKEN_SIZE + SHA512_DIGEST_LENGTH); printf("\n");
 		// END PIXEL 2 WEAVER
 	} else {
 		printf("using secdis to decrypt spblob\n");
@@ -967,7 +920,7 @@ bool Decrypt_User_Synth_Pass(const userid_t user_id, const std::string& Password
 				}
 			}
 			if (gkResponse.response_code() == GKResponseCode::OK) {
-				if (gkResponse.payload().size() != 0) {
+				if (gkResponse.payload().size() == sizeof(hw_auth_token_t)) {
 					const hw_auth_token_t* hwAuthToken =
 						reinterpret_cast<const hw_auth_token_t*>(gkResponse.payload().data());
 					HardwareAuthToken authToken;
@@ -978,14 +931,18 @@ bool Decrypt_User_Synth_Pass(const userid_t user_id, const std::string& Password
 					authToken.authenticatorType = static_cast<HardwareAuthenticatorType>(
 							betoh32(hwAuthToken->authenticator_type));
 					authToken.mac.assign(&hwAuthToken->hmac[0], &hwAuthToken->hmac[32]);
-					AIBinder* authzAIBinder = android::keystore::waitForService("android.security.authorization");
-					::ndk::SpAIBinder binder(authzAIBinder);
+					auto binder = android::keystore::waitForService("android.security.authorization");
 					auto service = aidl::android::security::authorization::IKeystoreAuthorization::fromBinder(binder);
 					if (service == NULL) {
 						printf("error: could not connect to keystore service\n");
 						ALOGE("error: could not connect to keystore service\n");
+						return Free_Return(retval, weaver_key, &pwd);
 					}
-					auto binder_result = service->addAuthToken(authToken);
+					const auto binder_result = service->addAuthToken(authToken);
+					if (!binder_result.isOk()) {
+						printf("Keystore authorization rejected the authentication token\n");
+						return Free_Return(retval, weaver_key, &pwd);
+					}
 				}
 			}
 

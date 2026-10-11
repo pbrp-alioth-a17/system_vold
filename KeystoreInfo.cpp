@@ -88,8 +88,9 @@ bool KeystoreInfo::backupDatabase(const std::string& src, const std::string& dst
 			sqlite3_open(dst.c_str(), &dst_db) == SQLITE_OK) {
 		sqlite3_backup *backup = sqlite3_backup_init(dst_db, "main", src_db, "main");
 		if (backup) {
-			sqlite3_backup_step(backup, -1);
-			ok = sqlite3_backup_finish(backup) == SQLITE_OK;
+			const int step_result = sqlite3_backup_step(backup, -1);
+			const int finish_result = sqlite3_backup_finish(backup);
+			ok = step_result == SQLITE_DONE && finish_result == SQLITE_OK;
 		}
 	}
 	if (!ok)
