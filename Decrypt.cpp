@@ -256,51 +256,48 @@ bool Get_Spblob_Data(const std::string& spblob_path, const std::string& handle_s
 /* C++ replacement for
  * https://android.googlesource.com/platform/frameworks/base/+/android-8.0.0_r23/services/core/java/com/android/server/locksettings/SyntheticPasswordManager.java#764 */
 bool Get_Password_Data(const std::string& spblob_path, const std::string& handle_str, password_data_struct *pwd) {
-	std::string pwd_data;
-	if (!Get_Spblob_Data(spblob_path, handle_str, ".pwd", "password", &pwd_data))
+	if (!pwd) return false;
+	*pwd = {};
+	std::string data;
+	if (!Get_Spblob_Data(spblob_path, handle_str, ".pwd", "password", &data))
 		return false;
-	const int* intptr = (const int*)pwd_data.data();
-	pwd->password_type = *intptr;
-	endianswap(&pwd->password_type);
-	//printf("password type %i\n", pwd->password_type); // 2 was PIN, 1 for pattern, 2 also for password, -1 for default password
-	const unsigned char* byteptr = (const unsigned char*)pwd_data.data() + sizeof(int);
-	pwd->scryptN = *byteptr;
-	byteptr++;
-	pwd->scryptR = *byteptr;
-	byteptr++;
-	pwd->scryptP = *byteptr;
-	byteptr++;
-	intptr = (const int*)byteptr;
-	pwd->salt_len = *intptr;
-	endianswap(&pwd->salt_len);
-	if (pwd->salt_len != 0) {
-		pwd->salt = malloc(pwd->salt_len);
-		if (!pwd->salt) {
-			printf("Get_Password_Data malloc salt\n");
-			return false;
-		}
-		memcpy(pwd->salt, intptr + 1, pwd->salt_len);
-		intptr++;
-		byteptr = (const unsigned char*)intptr;
-		byteptr += pwd->salt_len;
-	} else {
-		printf("Get_Password_Data salt_len is 0\n");
+	size_t offset = 0;
+	auto readInt = [&](uint32_t* value) {
+		if (data.size() - offset < 4) return false;
+		const auto* bytes = reinterpret_cast<const unsigned char*>(data.data() + offset);
+		*value = (uint32_t(bytes[0]) << 24) | (uint32_t(bytes[1]) << 16)
+			| (uint32_t(bytes[2]) << 8) | uint32_t(bytes[3]);
+		offset += 4;
+		return true;
+	};
+	uint32_t type, saltLen, handleLen;
+	if (!readInt(&type) || data.size() - offset < 3) return false;
+	// Match Android's short credential type, including Android 14's
+	// temporary format prefix. Later optional fields may follow the handle.
+	const uint32_t shortType = type & 0xffff;
+	pwd->password_type = shortType >= 0x8000 ? int(shortType) - 0x10000 : int(shortType);
+	pwd->scryptN = static_cast<unsigned char>(data[offset++]);
+	pwd->scryptR = static_cast<unsigned char>(data[offset++]);
+	pwd->scryptP = static_cast<unsigned char>(data[offset++]);
+	if (!readInt(&saltLen) || saltLen == 0 || saltLen > INT32_MAX
+			|| saltLen > data.size() - offset) return false;
+	const size_t saltOffset = offset;
+	offset += saltLen;
+	if (!readInt(&handleLen) || handleLen > INT32_MAX
+			|| handleLen > data.size() - offset) return false;
+	void* salt = malloc(saltLen);
+	void* handle = handleLen ? malloc(handleLen) : nullptr;
+	if (!salt || (handleLen && !handle)) {
+		free(salt);
+		free(handle);
 		return false;
 	}
-	intptr = (const int*)byteptr;
-	pwd->handle_len = *intptr;
-	endianswap(&pwd->handle_len);
-	if (pwd->handle_len != 0) {
-		pwd->password_handle = malloc(pwd->handle_len);
-		if (!pwd->password_handle) {
-			printf("Get_Password_Data malloc password_handle\n");
-			return false;
-		}
-		memcpy(pwd->password_handle, intptr + 1, pwd->handle_len);
-	} else {
-		printf("Get_Password_Data handle_len is 0\n");
-		// Not an error if using weaver
-	}
+	memcpy(salt, data.data() + saltOffset, saltLen);
+	if (handleLen) memcpy(handle, data.data() + offset, handleLen);
+	pwd->salt_len = saltLen;
+	pwd->salt = salt;
+	pwd->handle_len = handleLen;
+	pwd->password_handle = handle;
 	return true;
 }
 
@@ -313,9 +310,13 @@ bool Get_Password_Token(const password_data_struct *pwd, const std::string& Pass
 		printf("password_token is null\n");
 		return false;
 	}
-	unsigned int N = 1 << pwd->scryptN;
-	unsigned int r = 1 << pwd->scryptR;
-	unsigned int p = 1 << pwd->scryptP;
+	if (!pwd || pwd->scryptN >= 63 || pwd->scryptR >= 32 || pwd->scryptP >= 32) {
+		printf("Invalid scrypt parameters\n");
+		return false;
+	}
+	uint64_t N = uint64_t{1} << pwd->scryptN;
+	unsigned int r = 1U << pwd->scryptR;
+	unsigned int p = 1U << pwd->scryptP;
 	//printf("N %i r %i p %i\n", N, r, p);
 	int ret = crypto_scrypt(reinterpret_cast<const uint8_t*>(Password.data()), Password.size(),
                           reinterpret_cast<const uint8_t*>(pwd->salt), pwd->salt_len,
@@ -339,43 +340,25 @@ struct weaver_data_struct {
  * called here
  * https://android.googlesource.com/platform/frameworks/base/+/android-8.0.0_r23/services/core/java/com/android/server/locksettings/SyntheticPasswordManager.java#768 */
 bool Get_Weaver_Data(const std::string& spblob_path, const std::string& handle_str, weaver_data_struct *wd) {
-	printf("Get_Weaver_Data\n");
-	bool found_file = false;
-	std::string weaver_data;
-	std::string file = spblob_path + handle_str + ".weaver";
-	if (android::vold::pathExists(file)) {
-		if (!android::base::ReadFileToString(file, &weaver_data)) {
-			printf("Failed to read '%s'\n", file.c_str());
-		} else
-			found_file = true;
-	} else {
-		printf("trying to read %s_file data with leading 0\n", file.c_str());
-		std::vector<std::string> file_paths = {
-			spblob_path + "0" + handle_str + ".weaver",
-			spblob_path + "00" + handle_str + ".weaver"
-		};
-		for (auto& file : file_paths) {
-			if (!android::base::ReadFileToString(file, &weaver_data)) {
-				printf("Failed to read '%s'\n", file.c_str());
-			} else {
-				found_file = true;
-				break;
-			}
-		}
+	std::string data;
+	if (!wd || !Get_Spblob_Data(spblob_path, handle_str, ".weaver", "weaver", &data))
+		return false;
+	// SyntheticPasswordManager writes one version byte followed by a
+	// big-endian slot integer, without native alignment or padding.
+	if (data.size() != 5 || static_cast<unsigned char>(data[0]) != 1) {
+		printf("Invalid Weaver slot data\n");
+		return false;
 	}
-	if (found_file == false) {
-		printf("Get_Weaver_Data: No weaver file found for %s\n", handle_str.c_str());
-		return found_file;
-	} else {
-		const unsigned char* byteptr = (const unsigned char*)weaver_data.data();
-		wd->version = *byteptr;
-		// printf("weaver version %i\n", wd->version);
-		const int* intptr = (const int*)weaver_data.data() + sizeof(unsigned char);
-		wd->slot = *intptr;
-		//endianswap(&wd->slot); not needed
-		// printf("weaver slot %i\n", wd->slot);
+	const auto* bytes = reinterpret_cast<const unsigned char*>(data.data());
+	const uint32_t slot = (uint32_t(bytes[1]) << 24) | (uint32_t(bytes[2]) << 16)
+				| (uint32_t(bytes[3]) << 8) | uint32_t(bytes[4]);
+	if (slot > INT32_MAX) {
+		printf("Invalid Weaver slot number\n");
+		return false;
 	}
-	return found_file;
+	wd->version = bytes[0];
+	wd->slot = static_cast<int>(slot);
+	return true;
 }
 
 namespace android {
